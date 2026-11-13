@@ -20,6 +20,7 @@ ADGUARD_PERSONAL_FILENAME="${ADGUARD_PERSONAL_HASH}.0"
 ADGUARD_INTERMEDIATE_HASH="47ec1af8"
 ADGUARD_INTERMEDIATE_TEXT="Guard Personal Intermediate"
 
+# Append timestamped messages to the module log.
 log() {
     echo "$(date '+%m-%d %H:%M:%S ')" "$@" >> "$MODDIR/log.txt"
 }
@@ -127,13 +128,71 @@ copy_certificate() {
     cp -f "$source" "$target"
 }
 
-# The Personal CA has a required filename, so it is copied explicitly.
-copy_certificate_as() {
+# Android stores user CAs as DER, but BoringSSL-based stacks that read the
+# cacerts directory directly, such as Flutter/Dart's dart:io, only accept PEM.
+copy_certificate_as_pem() {
     local source="$1"
     local destination_dir="$2"
-    local name="$3"
+    local requested_name="$3"
+    local name
+    local target
+    local base
+    local index
+    local converted="$STAGING_DIR/.cert-pem-$$"
+    local status
 
-    cp -f "$source" "$destination_dir/$name"
+    if grep -q -- "-----BEGIN CERTIFICATE-----" "$source"; then
+        if ! cp -f "$source" "$converted"; then
+            return 1
+        fi
+    else
+        if ! {
+            echo "-----BEGIN CERTIFICATE-----"
+            base64 < "$source" | tr -d '\n' | fold -w 64
+            echo
+            echo "-----END CERTIFICATE-----"
+        } > "$converted"; then
+            rm -f "$converted"
+            return 1
+        fi
+    fi
+
+    name=${requested_name:-$(basename "$source")}
+    target="$destination_dir/$name"
+
+    if [ -e "$target" ]; then
+        if cmp -s "$converted" "$target"; then
+            rm -f "$converted"
+            return 0
+        fi
+
+        case "$name" in
+            *.*)
+                base=${name%.*}
+                ;;
+            *)
+                base=$name
+                ;;
+        esac
+
+        index=1
+        target="$destination_dir/$base.$index"
+
+        while [ -e "$target" ]; do
+            if cmp -s "$converted" "$target"; then
+                rm -f "$converted"
+                return 0
+            fi
+
+            index=$((index + 1))
+            target="$destination_dir/$base.$index"
+        done
+    fi
+
+    cp -f "$converted" "$target"
+    status=$?
+    rm -f "$converted"
+    return "$status"
 }
 
 # Staging is disposable and is rebuilt for every run.
@@ -141,12 +200,12 @@ clear_staged_certificates() {
     rm -rf "$STAGING_DIR"
 }
 
-# Record whether the live directory is backed up, or has been fully replaced.
+# Record whether the live directory is backed up or fully replaced.
 write_publish_state() {
     printf '%s\n' "$1" > "$PUBLISH_STATE_FILE"
 }
 
-# Save the currently published set before making any changes to it.
+# Save the currently published set before making changes.
 backup_live_certificates() {
     local cert
     local name
@@ -196,7 +255,7 @@ restore_live_certificates() {
     done
 }
 
-# Finish or roll back a publication that was interrupted by a reboot.
+# Finish or roll back a publication interrupted by a reboot.
 recover_interrupted_publish() {
     local state
 
@@ -233,8 +292,7 @@ recover_interrupted_publish() {
     rm -rf "$BACKUP_DIR"
 }
 
-# Build the desired certificate set in a temporary directory. The live
-# directory is not changed until this collection step succeeds.
+# Build the desired certificate set in a temporary directory.
 collect_certificates() {
     local certificate_count=0
     local certificate_name
@@ -246,6 +304,7 @@ collect_certificates() {
         return 1
     fi
 
+    # Collect certificates already present in the system store.
     log "Grabbing system certificates"
 
     for cert in "$SYS_CERT_DIR"/*; do
@@ -272,6 +331,7 @@ collect_certificates() {
         certificate_count=$((certificate_count + 1))
     done
 
+    # Collect certificates from every Android user profile.
     log "Grabbing user certificates"
 
     for user_dir in /data/misc/user/*; do
@@ -292,7 +352,7 @@ collect_certificates() {
                 continue
             fi
 
-            if ! copy_certificate "$cert" "$STAGING_DIR"; then
+            if ! copy_certificate_as_pem "$cert" "$STAGING_DIR"; then
                 log "Failed to copy user certificate: $cert"
                 return 1
             fi
@@ -302,11 +362,11 @@ collect_certificates() {
         done
     done
 
-    # AdGuard requires its current Personal CA to be named exactly .0.
+    # Publish the newest AdGuard Personal CA under its required filename.
     adguard_personal=$(find_adguard_personal_certificate)
 
     if [ -n "$adguard_personal" ]; then
-        if ! copy_certificate_as \
+        if ! copy_certificate_as_pem \
             "$adguard_personal" \
             "$STAGING_DIR" \
             "$ADGUARD_PERSONAL_FILENAME"; then
@@ -323,16 +383,17 @@ collect_certificates() {
     log "Collected $certificate_count pre-APEX certificate files"
 }
 
-# Replace the live set transactionally: back it up, publish the staged files,
-# remove stale files, and clean up the journal only after success.
+# Publish the staged certificate set with rollback protection.
 publish_certificates() {
     local cert
     local name
 
+    # Back up the current live certificate set before changing it.
     if ! backup_live_certificates; then
         return 1
     fi
 
+    # Mark the publication as recoverable until it completes.
     if ! write_publish_state prepared; then
         log "Failed to create publication journal"
         rm -rf "$BACKUP_DIR"
@@ -345,6 +406,7 @@ publish_certificates() {
         return 1
     fi
 
+    # Copy all staged certificates into the live directory.
     for cert in "$STAGING_DIR"/*; do
         [ -f "$cert" ] || continue
 
@@ -357,6 +419,7 @@ publish_certificates() {
         fi
     done
 
+    # Remove certificates that are no longer part of the collected set.
     for cert in "$LIVE_CERT_DIR"/*; do
         [ -f "$cert" ] || continue
 
@@ -370,6 +433,7 @@ publish_certificates() {
         fi
     done
 
+    # Mark the publication complete before removing recovery data.
     if ! write_publish_state published; then
         log "Failed to finalize publication journal"
         restore_live_certificates
@@ -381,18 +445,20 @@ publish_certificates() {
     clear_staged_certificates
 }
 
-# The post-fs-data hook runs early in boot, before consumers need the
-# certificate set. Failures are logged and leave the previous set intact.
+# Run the post-fs-data certificate collection and publication workflow.
 main() {
+    # Start each boot with a fresh log.
     if ! : > "$MODDIR/log.txt"; then
         return 1
     fi
 
+    # Recover any publication interrupted during the previous boot.
     if ! recover_interrupted_publish; then
         log "Failed to recover interrupted publication"
         return 1
     fi
 
+    # Remove the completion marker until this run succeeds.
     if ! rm -f "$CERTS_READY_FILE"; then
         log "Failed to remove certificate completion marker"
         return 1
@@ -400,18 +466,21 @@ main() {
 
     log "AlwaysTrustUserCerts - post-fs-data.sh"
 
+    # Collect certificates into staging before touching the live directory.
     if ! collect_certificates; then
         log "Failed to collect certificates"
         clear_staged_certificates
         return 1
     fi
 
+    # Publish the complete staged set.
     if ! publish_certificates; then
         log "Failed to publish certificates"
         clear_staged_certificates
         return 1
     fi
 
+    # Signal that the complete certificate set is ready.
     if ! : > "$CERTS_READY_FILE"; then
         log "Failed to mark certificate completion"
         return 1
@@ -420,5 +489,6 @@ main() {
     log "Finished collecting certificates"
 }
 
+# Start the post-fs-data hook.
 main
 exit $?

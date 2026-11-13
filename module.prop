@@ -1,6 +1,6 @@
 id=trustusercerts
 name=Always Trust User Certificates
-version=v1.4
-versionCode=46
+version=v1.5
+versionCode=47
 author=Jeroen Beckers (NVISO.eu)
 description=Copy user certs to the system trust store

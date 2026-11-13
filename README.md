@@ -1,27 +1,38 @@
 # Always Trust User Certificates
 
-A Magisk/KernelSU module that copies Android user-installed CA certificates into the system trust store, allowing applications that normally reject user certificates to trust them without a `network_security_config` override.
+Always Trust User Certificates is a Magisk, KernelSU, and KernelSU Next module
+that adds Android user-installed CA certificates to the system trust store.
+This allows applications that do not trust user certificates by default to use
+them without a `network_security_config` override.
 
-> **Warning:** This changes the device-wide certificate trust configuration. Applications that normally reject user certificates may trust them after the module is enabled. Install certificates only from sources you trust.
+> **Warning:** This changes certificate trust for the entire device. Only
+> install certificates from sources you trust. Applications can still enforce
+> certificate pinning or other custom trust rules.
 
 ## Features
 
 - Supports Magisk, KernelSU, and KernelSU Next.
 - Supports multiple Android users.
 - Supports Android 7 through Android 17.
-- Supports traditional system CA directories and Mainline Conscrypt.
-- Detects standard and versioned Conscrypt APEX certificate paths.
-- Stages certificate updates before publishing them.
-- Preserves the previous certificate set if collection or publication fails.
-- Recovers from interrupted certificate publication after reboot.
+- Supports traditional system certificate directories.
+- Supports Mainline Conscrypt APEX certificate directories.
+- Detects standard and versioned Conscrypt APEX paths.
+- Converts user certificates from DER to PEM format.
+- Preserves PEM certificates without re-encoding them.
+- Handles AdGuard Personal and Intermediate certificates specially.
+- Stages certificate changes before publishing them.
+- Removes certificates that were deleted from Android user profiles.
+- Backs up and restores the previous certificate set.
+- Recovers from interrupted publication after a reboot.
 - Injects certificate mounts into zygote and application namespaces.
-- Monitors both 32-bit (`zygote`) and 64-bit (`zygote64`) zygotes.
-- Reapplies mounts after namespace changes or zygote restarts.
-- Waits up to five minutes for Android boot completion instead of looping indefinitely.
-- Includes AdGuard Personal CA handling.
-- Includes an action script for certificate counts and status reporting.
+- Monitors both 32-bit (`zygote`) and 64-bit (`zygote64`) processes.
+- Waits up to five minutes for Android boot completion.
+- Provides an action script with certificate counts and status information.
 
-Depending on the Android version and Google Play system update, certificates may be stored in:
+## How It Works
+
+Depending on the Android version and Google Play system update, certificates
+may be stored in one of these locations:
 
 - `/system/etc/security/cacerts`
 - `/apex/com.android.conscrypt/cacerts`
@@ -29,48 +40,73 @@ Depending on the Android version and Google Play system update, certificates may
 
 The module detects the active location automatically.
 
+During `post-fs-data`, the module:
+
+1. Reads system certificates.
+2. Reads certificates from every Android user profile.
+3. Converts DER-encoded user certificates to PEM format for compatibility with
+   certificate consumers that read the directory directly, including
+   BoringSSL-based stacks such as Flutter/Dart.
+4. Applies the AdGuard certificate rules.
+5. Builds the complete certificate set in a staging directory.
+6. Backs up the currently published set.
+7. Publishes the staged set and removes stale certificates.
+8. Creates a completion marker only after publication succeeds.
+
+If publication is interrupted or fails, the previous complete certificate set
+is restored where possible.
+
+## Conscrypt APEX Support
+
+On devices using Mainline Conscrypt, `service.sh`:
+
+1. Detects the active Conscrypt APEX certificate directory.
+2. Adds its certificates to the collected module certificate set.
+3. Creates a writable combined certificate directory.
+4. Mounts the combined directory over the traditional system certificate path.
+5. Applies ownership, permissions, and SELinux labels.
+6. Injects the mount into zygote and application mount namespaces.
+
+The service monitors both `zygote` and `zygote64`, and retries namespace
+injection when processes restart or change namespaces.
+
+The service waits up to **300 seconds** for `sys.boot_completed`. If Android
+does not finish booting within that period, the service logs the failure and
+exits instead of waiting indefinitely.
+
+## AdGuard Certificate Handling
+
+The module:
+
+- Places the current AdGuard Personal CA in the system certificate set.
+- Publishes the Personal CA using the required filename `0f4ed297.0`.
+- Selects the newest Personal CA when multiple user profiles contain versions
+  of the certificate.
+- Keeps the AdGuard Intermediate CA out of the system set so it remains in the
+  Android user certificate store.
+
 ## Installation
 
-1. Install a CA certificate through Android Settings.
+1. Install the CA certificate through Android Settings.
 2. Install this module through Magisk, KernelSU, or KernelSU Next.
 3. Reboot the device.
-4. Check the module log or run the module action to display certificate counts.
+4. Verify the module log or run the module action.
 
-After reboot, collected user certificates are included in the system trust store. Applications may still enforce certificate pinning or other custom trust restrictions.
-
-## Certificate Collection and Publication
-
-During early boot, the module:
-
-1. Collects system certificates and certificates installed for all Android users.
-2. Excludes stale or user-store-only AdGuard certificates where required.
-3. Builds the desired certificate set in a staging directory.
-4. Backs up the currently published certificate set.
-5. Publishes the staged set and removes stale files.
-6. Marks the set ready only after publication succeeds.
-
-If publication is interrupted or fails, the previous certificate set is restored where possible. This prevents a partial update from replacing the working trust store with an incomplete one.
-
-## Conscrypt and Namespace Injection
-
-On devices with a Conscrypt APEX, `service.sh` creates a writable combined certificate directory and bind-mounts it into the active Conscrypt certificate path.
-
-Android processes can use separate mount namespaces, so the service checks and injects the mount for both zygotes and their application children.
-
-The service waits up to **300 seconds** for `sys.boot_completed`. If boot does not complete within that period, it logs a timeout and exits instead of running forever.
+The module must be active after reboot for newly installed or removed
+certificates to be reflected in the system trust store.
 
 ## Module Action
 
-The included `action.sh` script displays certificate counts and AdGuard status.
+Run the module action from the Magisk or KernelSU module interface.
 
-Run the action from the Magisk or KernelSU module action interface. It reports:
+The action reports:
 
-- System certificate count
-- User certificate count across all Android users
-- Total certificate count
-- Whether the AdGuard Personal CA is enabled
+- System certificate count.
+- User certificate count across all Android users.
+- Total certificate count.
+- AdGuard Personal CA status.
 
-Example output:
+Example:
 
 ```text
 Always Trust User Certificates
